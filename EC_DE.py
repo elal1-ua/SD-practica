@@ -17,7 +17,11 @@ producer_estado=KafkaProducer(
     bootstrap_servers='localhost:9092',
     value_serializer=lambda v: json.dumps(v).encode('utf-8')    
 )
+
 global taxipos
+global parar
+global en_movimiento
+global ko
 taxipos=[1,1]
 
 DIRECTIONS = {
@@ -31,20 +35,8 @@ DIRECTIONS = {
     "SE": (1, 1)
 }
 
-consumer_posicion = KafkaConsumer(
-    'Posicion',
-    bootstrap_servers='localhost:9092',
-    value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-    auto_offset_reset='latest',
-    enable_auto_commit=True
-)
-consumer_servicio = KafkaConsumer(
-    'Servicio_taxi',
-    bootstrap_servers='localhost:9092',
-    value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-    auto_offset_reset='latest',
-    enable_auto_commit=True
-)
+
+
 
 consumer_mapa = KafkaConsumer(
     'Mapa',
@@ -55,8 +47,8 @@ consumer_mapa = KafkaConsumer(
     group_id='Taxis'
 )
 
-if len(sys.argv) != 6:
-    print("Usage: python3 EC_DE.py <IP EC_S> <PORT EC_S> <IP CENTRAL> <CENTRAL PORT> <ID TAXI>")
+if len(sys.argv) != 4:
+    print("Usage: python3 EC_DE.py <IP CENTRAL> <CENTRAL PORT> <ID TAXI>")
     sys.exit(1)
 
 # Servidor empieza en 8080 y si está ocupado, intenta con el siguiente puerto
@@ -115,7 +107,7 @@ def calcular_mejor_direccion(destino):
     elif delta_columna > 0:
         movimiento="E"
     producer_movs.send('Movs',value={"Movimiento":movimiento,"id":id_taxi})
-    time.sleep(1)
+    time.sleep(2)
     return movimiento
 
 
@@ -143,35 +135,93 @@ def nueva_posicion(direccion):
 
 def mover_taxi(destino):
     global taxipos
+    global parar
     while taxipos!=destino:
+        if ko==True:
+            print("KO")
+            break
+        if parar==True:
+            print("Taxi detenido")
+            break
         mejor_direccion=calcular_mejor_direccion(destino)
         taxipos=nueva_posicion(mejor_direccion)
         
 
+
 def posiciones_taxi():
+    global en_movimiento
+    en_movimiento=False
     print("Esperando mensajes en el topic 'Posicion'...")
+    consumer_posicion = KafkaConsumer(
+    'Posicion',
+    bootstrap_servers='localhost:9092',
+    value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+    auto_offset_reset='latest',
+    enable_auto_commit=True
+    )
+     # Asegurar acceso exclusivo al consumidor
     for message in consumer_posicion:
         print(f"Mensaje recibido: {message.value}")
-        if message.value["id"]==id_taxi:
-            taxipos[0]=message.value["posx"]
-            taxipos[1]=message.value["posy"]
+        if message.value["id"] == id_taxi:
+            taxipos[0] = message.value["posx"]
+            taxipos[1] = message.value["posy"]
             print(f"Posicion actual: {taxipos}")
             exit(1)
 
+def detener_taxi():
+    global parar
+    print("Esperando mensajes en el topic 'Posicion'...")
+    consumer_detener = KafkaConsumer(
+    'DETENER_TAXI',
+    bootstrap_servers='localhost:9092',
+    value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+    auto_offset_reset='latest',
+    enable_auto_commit=True
+    )
+     # Asegurar acceso exclusivo al consumidor
+    for message in consumer_detener:
+        if message.value["id"] == int(id_taxi):
+            if message.value["Estado"] == 'PARAR':
+                print("Taxi ha sido detenido.")
+                parar=True
+            elif message.value["Estado"] == 'REANUDAR':
+                print("Taxi ha sido reanudado.")
+                parar=False
+
+
 
 def service_taxi(client_socket):
+    global en_movimiento
+    global parar
+    parar=False
     print("Esperando mensajes en el topic 'Servicio'...")
+    consumer_servicio = KafkaConsumer(
+    'Servicio_taxi',
+    bootstrap_servers='localhost:9092',
+    value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+    auto_offset_reset='latest',
+    enable_auto_commit=True
+    )
     for message in consumer_servicio:
         print(f"Mensaje recibido: {message.value}")
-        if message.value["Estado"]=="STOP":
+        if message.value["Estado"] == "STOP":#LA CENTRAL HA DESAPARECIDO
             print("Servidor detenido")
             client_socket.sendall(b"Servidor detenido")
             client_socket.close()
             exit(1)
-        if message.value["id"]==int(id_taxi):
+        elif message.value["id"] == int(id_taxi):
             print(f"Servicio asignado: {message.value}")
+            en_movimiento=True
+            parar=False
             mover_taxi(message.value["destino"])
-            producer_estado.send('Estado',value={"Estado":"END","id":id_taxi})
+            en_movimiento=False
+            if ko==True or parar==True:
+                print("NO ENVIO END")  
+            else:
+                print(f"Taxi {id_taxi} ha llegado a su destino en la posicion {taxipos}.")
+                producer_estado.send('Estado', value={"Estado": "END", "id": id_taxi})
+            
+        
             
             
 
@@ -185,21 +235,26 @@ def service_taxi(client_socket):
 
 
 def handle_client(client_socket):
+    global ko
+    global en_movimiento
     try:
         client_socket.sendall(b"Conexion exitosa!")
         start_client(ip_central, puerto_central, id_taxi, client_socket,0)
         #threading.Thread(target=process_Mapa, args=(), daemon=True).start()
         ko=False
+        
         threading.Thread(target=service_taxi, args=(client_socket,), daemon=True).start()
+        threading.Thread(target=detener_taxi, args=(), daemon=True).start()
         while True:  # Bucle para manejar los mensajes del cliente
             data = client_socket.recv(1024)
             if not data:
                 print("Cliente desconectado.")
+                producer_estado.send('Estado',value={"Estado":"KO","id":id_taxi})
                 break
             message = data.decode()
             
             if message == "KO" and ko==False:
-                print("Enviado a central")
+                print("Enviado a central KO")
                 producer_estado.send('Estado',value={"Estado":"KO","id":id_taxi})
                 ko=True
             elif message == "OK" and ko==True:
@@ -209,7 +264,9 @@ def handle_client(client_socket):
     except OSError as e:
         exit(1)
     except KeyboardInterrupt:
-        print("Servidor detenido")
+        print("Servidor detenido en la central.")
+        if en_movimiento==True:
+            producer_estado.send('Estado',value={"Estado":"STOP","id":id_taxi})
         client_socket.sendall(b"Servidor detenido")
         client_socket.close()
         start_client(ip_central, puerto_central, id_taxi, client_socket,1)
@@ -223,15 +280,18 @@ def handle_client(client_socket):
         
         
 def start_client(ip_central, puerto_central, id_taxi, client_socket_client,error):
+    
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        threading.Thread(target=posiciones_taxi, args=(), daemon=True).start()
+        
         client_socket.connect((ip_central, puerto_central))#CENTRAL
         if error == 1:
             value={"ESTADO":"STOP","id":id_taxi}
-            client_socket.sendall(value.encode())
+            client_socket.sendall(json.dumps(value).encode())
             client_socket.close()
             exit(1)
+        threading.Thread(target=posiciones_taxi, args=(), daemon=True).start()
+        time.sleep(1.5)
         client_socket.sendall(str(id_taxi).encode())
         
         if client_socket.recv(1024).decode() == "ID valido.":
@@ -258,10 +318,9 @@ def start_client(ip_central, puerto_central, id_taxi, client_socket_client,error
 
 
 if __name__ == "__main__":
-    expected_client_ip = sys.argv[1]  # Puedes definir esto según tu configuración
-    expected_client_port = int(sys.argv[2]) # Puerto esperado del cliente
-    puerto_central = int(sys.argv[4])
-    ip_central = sys.argv[3]
-    id_taxi = sys.argv[5]
+
+    puerto_central = int(sys.argv[2])
+    ip_central = sys.argv[1]
+    id_taxi = sys.argv[3]
     
     start_server()
