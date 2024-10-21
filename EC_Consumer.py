@@ -1,20 +1,20 @@
 import sys
 import time
 import json
-import sqlite3
+import threading
 from kafka import KafkaProducer
 from kafka import KafkaConsumer
 class ECCustomer:
     def __init__(self, broker_ip, broker_port, customer_id, pickup_x, pickup_y, file_path):
         # Conexión al broker de Kafka
         self.producer = KafkaProducer(
-            bootstrap_servers="localhost:9092",
+            bootstrap_servers=broker_ip + ':' + broker_port,
             value_serializer=lambda v: json.dumps(v).encode('utf-8')
         )
         
         self.consumer_posicion = KafkaConsumer(
             'Posicion_cliente',
-            bootstrap_servers='localhost:9092',
+            bootstrap_servers=broker_ip + ':' + broker_port,
             value_deserializer=lambda x: json.loads(x.decode('utf-8')),
             auto_offset_reset='latest',
             enable_auto_commit=True
@@ -22,7 +22,7 @@ class ECCustomer:
         
         self.consumer = KafkaConsumer(
             'Servicios_cliente',
-            bootstrap_servers='localhost:9092',
+            bootstrap_servers=broker_ip + ':' + broker_port,
             value_deserializer=lambda x: json.loads(x.decode('utf-8')),
             auto_offset_reset='latest',
             enable_auto_commit=True,
@@ -31,6 +31,9 @@ class ECCustomer:
         self.customer_id = customer_id
         self.pickup_location = (pickup_x, pickup_y)  # Almacena las coordenadas X e Y
         self.file_path = file_path
+        self.contador_activo = True
+        self.error = False
+        self.last_message_time =8
     
     def read_services(self):
         # Leer las solicitudes de servicio del archivo
@@ -45,38 +48,40 @@ class ECCustomer:
             'customer_id': self.customer_id,
             'pickup_location': pickup,
             'destination': destination,
+            
         }
         print(f"Solicitando servicio de taxi desde {pickup} hasta {destination}")
         # Enviar el mensaje al topic de Kafka
         self.producer.send('Servicios', value=message)
         
+        
         for msg in self.consumer: #HACER UN HILO PARA QUE ESTE LEYENDO SI LA CENTRAL HA FALLADO (customer_id == "all")
-            
+            print("Mensaje recibido")
             if msg.value['customer_id'] != "all":#La central envia el mensaje a todos los clientes de que ha tenido un error
                 if msg.value['customer_id'] == self.customer_id:
+                    self.contador_activo = False
+                    self.last_message_time =8
                     print(f"Taxi {msg.value['taxi_id']} asignado para el servicio de {pickup} a {destination}")
                     if msg.value['taxi_id'] != None:
                         for message in self.consumer_posicion:
                             if message.value['customer_id'] == self.customer_id:
                                 print(f"Taxi {message.value}")
                                 self.pickup_location = message.value['cliente_pos']
-                                conn=sqlite3.connect('Taxi.db')
-                                cursor=conn.cursor()
-                                cursor.execute(f"UPDATE Cliente SET posx = {self.pickup_location[0]} where id = '{self.customer_id}'")
-                                cursor.execute(f"UPDATE Cliente SET posy = {self.pickup_location[1]} where id = '{self.customer_id}'")
-                                conn.commit()
                                 break
                             elif message.value['customer_id'] == "all":
                                 print("Error: La central ha fallado")
                                 exit(1)
+                            
                     else:
                         print("Error: No hay taxis disponibles")
-                        
-                    break   
+                            
+                    break     
             else:
-                print("Error: La conexion con la central ha fallado")
+                print("Error: La conexion con la central ha fallado")                  
                 exit(1)
-                
+
+    
+    
     def run(self):
         # Leer los destinos de servicio
         services = self.read_services()
@@ -85,8 +90,11 @@ class ECCustomer:
             # Enviar la solicitud de taxi
             self.send_service_request(self.pickup_location, service)
             # Esperar 4 segundos antes de enviar la siguiente solicitud
+            
             time.sleep(4)
+        print("No hay más destinos.Enviando señal a la central")
         self.producer.send('Servicios', value={"customer_id": self.customer_id, "pickup_location": self.pickup_location, "destination": None})
+        time.sleep(4)
 
 if __name__ == '__main__':
     # Verificar que se recibieron los parámetros correctos

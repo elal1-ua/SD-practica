@@ -3,18 +3,31 @@ import socket
 import json
 import time
 import threading
+import os
+from colorama import Fore, Style
 from kafka.errors import kafka_errors
 from kafka import KafkaConsumer
 from kafka import KafkaProducer
 
 
+
+if len(sys.argv) != 6:
+    print("Usage: python3 EC_DE.py <IP_Broker> <Puerto Broker> <IP CENTRAL> <CENTRAL PORT> <ID TAXI>")
+    sys.exit(1)
+
+ip_broker = sys.argv[1]
+puerto_broker = sys.argv[2]
+ip_central = sys.argv[3]
+puerto_central = sys.argv[4]
+id_taxi = sys.argv[5]
+
 producer_movs=KafkaProducer(
-    bootstrap_servers='localhost:9092',
+    bootstrap_servers=ip_broker+':'+puerto_broker,
     value_serializer=lambda v: json.dumps(v).encode('utf-8')
 )
 
 producer_estado=KafkaProducer(     
-    bootstrap_servers='localhost:9092',
+    bootstrap_servers=ip_broker+':'+puerto_broker,
     value_serializer=lambda v: json.dumps(v).encode('utf-8')    
 )
 
@@ -38,18 +51,8 @@ DIRECTIONS = {
 
 
 
-consumer_mapa = KafkaConsumer(
-    'Mapa',
-    bootstrap_servers='localhost:9092',
-    value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-    auto_offset_reset='latest',
-    enable_auto_commit=True,
-    group_id='Taxis'
-)
 
-if len(sys.argv) != 4:
-    print("Usage: python3 EC_DE.py <IP CENTRAL> <CENTRAL PORT> <ID TAXI>")
-    sys.exit(1)
+
 
 # Servidor empieza en 8080 y si está ocupado, intenta con el siguiente puerto
 def start_server(base_port=8080):
@@ -61,6 +64,7 @@ def start_server(base_port=8080):
             server_socket.bind(('', port))
             server_socket.listen(1)
             print(f"Servidor escuchando en el puerto {port}...")
+            print(f"Escuchando en la IP: {socket.gethostbyname(socket.gethostname())}")
             
             while True:  # Bucle para aceptar múltiples clientes
                 print("Esperando conexión...")
@@ -69,8 +73,8 @@ def start_server(base_port=8080):
                 
                 print(f"Cliente conectado desde IP: {client_ip}, Puerto: {client_port}")
 
-                # Manejar la comunicación con el cliente
-                handle_client(client_socket)
+                if client_socket:
+                    handle_client(client_socket)
                 
         except OSError as e:
             print(f"Error al intentar iniciar el servidor en el puerto {port}: {e}")
@@ -147,6 +151,107 @@ def mover_taxi(destino):
         taxipos=nueva_posicion(mejor_direccion)
         
 
+def process_Mapa():
+    consumer_mapa = KafkaConsumer(
+    'Mapa',
+    bootstrap_servers=ip_broker+':'+puerto_broker,
+    value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+    auto_offset_reset='latest',
+    enable_auto_commit=True
+    )
+    for message in consumer_mapa:
+        
+        imprimir_mapa(crear_mapa(message.value['ubicaciones'],message.value['ubicaciones_cliente'],message.value['ubicaciones_taxi']))
+
+
+
+
+def crear_mapa(ubicaciones, ubicaciones_clientes, ubicaciones_taxi):
+    # Crear un mapa vacío de 20x20 (inicializado con listas vacías)
+    mapa = [[[] for _ in range(20)] for _ in range(20)]
+    no_imprimir_cliente = []
+    # Insertar las ubicaciones en el mapa
+    for nombre, (x, y) in ubicaciones.items():
+        if nombre == "Base":
+            continue
+        if 1 <= x <= 20 and 1 <= y <= 20:  # Verificar que las coordenadas están dentro de los límites
+            mapa[x-1][y-1].append(f"{Fore.BLUE}{nombre}{Style.RESET_ALL}")  # Añadir la ubicación en azul
+        else:
+            print(f"Coordenadas fuera de límites para {nombre}: ({x},{y})")
+
+    # Insertar los clientes
+    
+    # Insertar los taxis
+    for id_taxi, taxi_info in ubicaciones_taxi.items():
+        x, y = taxi_info['coordenadas']
+        if 1 <= x <= 20 and 1 <= y <= 20:
+            if taxi_info['estado'] == 'ND':  # Estado 'ND' significa que no se muestra
+                continue
+
+            # Construir la representación del taxi
+            taxi_str = f"{Fore.WHITE}{id_taxi}{Style.RESET_ALL}"  # Por defecto blanco
+            if taxi_info['estado'] == 'KO':
+                taxi_str = f"{Fore.RED}{id_taxi}{Style.RESET_ALL}{Fore.RED}{'!'}{Style.RESET_ALL}"
+            elif taxi_info['estado'] == 'RUN':
+                taxi_str = f"{Fore.GREEN}{id_taxi}{Style.RESET_ALL}"
+
+            # Verificar si el taxi tiene un pasajero
+            pasajero = taxi_info.get('pasajero')
+            if pasajero:
+                no_imprimir_cliente.append(pasajero)
+                if taxi_info['estado'] == 'RUN':
+                    taxi_str += f"({Fore.GREEN}{pasajero.lower()}{Style.RESET_ALL})"
+                elif taxi_info['estado'] == 'OKP':
+                    taxi_str += f"({Fore.RED}{pasajero.lower()}{Style.RESET_ALL})"
+                elif taxi_info['estado'] == 'KO':
+                    taxi_str += f"({Fore.RED}{pasajero.lower()}{Style.RESET_ALL})"
+
+            mapa[x-1][y-1].append(taxi_str)  # Añadir taxi al mapa
+        else:
+            print(f"Coordenadas fuera de límites para {id_taxi}: ({x},{y})")
+            
+    for id_cliente, (x, y) in ubicaciones_clientes.items():
+        if 1 <= x <= 20 and 1 <= y <= 20:
+            if id_cliente in no_imprimir_cliente:
+                continue
+            else:
+                mapa[x-1][y-1].append(f"{Fore.YELLOW}{id_cliente}{Style.RESET_ALL}")
+        else:
+            print(f"Coordenadas fuera de límites para {id_cliente}: ({x},{y})")
+
+    return mapa
+
+
+def imprimir_mapa(mapa):
+    # Crear encabezado ajustado para los números del eje X
+    encabezado = ["  "] + [f"{i:2}" for i in range(1, 21)]
+    os.system('clear')  # Limpiar la consola
+    # Imprimir el encabezado con los números de columna
+    print(" " + " ".join(encabezado))
+
+    # Imprimir el mapa con los números de fila y celdas compactas
+    for i, fila in enumerate(mapa):
+        fila_str = []
+        for celda in fila:
+            if len(celda) == 0:
+                fila_str.append('-')  # Si la celda está vacía, mostrar '-'
+            elif len(celda) == 1:
+                fila_str.append(celda[0])  # Si hay solo una entidad, mostrarla directamente
+            else:
+                fila_str.append(f"[{','.join(celda)}]")  # Si hay varias entidades, mostrar el formato [A,6,l]
+        
+        print(f"{i+1:2}  {'  '.join(fila_str)}")
+
+
+
+
+
+
+
+
+
+
+
 
 def posiciones_taxi():
     global en_movimiento
@@ -154,7 +259,7 @@ def posiciones_taxi():
     print("Esperando mensajes en el topic 'Posicion'...")
     consumer_posicion = KafkaConsumer(
     'Posicion',
-    bootstrap_servers='localhost:9092',
+    bootstrap_servers=ip_broker+':'+puerto_broker,
     value_deserializer=lambda x: json.loads(x.decode('utf-8')),
     auto_offset_reset='latest',
     enable_auto_commit=True
@@ -173,7 +278,7 @@ def detener_taxi():
     print("Esperando mensajes en el topic 'Posicion'...")
     consumer_detener = KafkaConsumer(
     'DETENER_TAXI',
-    bootstrap_servers='localhost:9092',
+    bootstrap_servers=ip_broker+':'+puerto_broker,
     value_deserializer=lambda x: json.loads(x.decode('utf-8')),
     auto_offset_reset='latest',
     enable_auto_commit=True
@@ -197,7 +302,7 @@ def service_taxi(client_socket):
     print("Esperando mensajes en el topic 'Servicio'...")
     consumer_servicio = KafkaConsumer(
     'Servicio_taxi',
-    bootstrap_servers='localhost:9092',
+    bootstrap_servers=ip_broker+':'+puerto_broker,
     value_deserializer=lambda x: json.loads(x.decode('utf-8')),
     auto_offset_reset='latest',
     enable_auto_commit=True
@@ -209,7 +314,7 @@ def service_taxi(client_socket):
             client_socket.sendall(b"Servidor detenido")
             client_socket.close()
             exit(1)
-        elif message.value["id"] == int(id_taxi):
+        elif int(message.value["id"]) == int(id_taxi):
             print(f"Servicio asignado: {message.value}")
             en_movimiento=True
             parar=False
@@ -245,6 +350,7 @@ def handle_client(client_socket):
         
         threading.Thread(target=service_taxi, args=(client_socket,), daemon=True).start()
         threading.Thread(target=detener_taxi, args=(), daemon=True).start()
+        threading.Thread(target=process_Mapa, args=(), daemon=True).start()
         while True:  # Bucle para manejar los mensajes del cliente
             data = client_socket.recv(1024)
             if not data:
@@ -262,9 +368,10 @@ def handle_client(client_socket):
                 producer_estado.send('Estado',value={"Estado":"OK","id":id_taxi})
                 ko=False
     except OSError as e:
+        print(f"Error al manejar el cliente:")
         exit(1)
     except KeyboardInterrupt:
-        print("Servidor detenido en la central.")
+        print("Servidor detenido.")
         if en_movimiento==True:
             producer_estado.send('Estado',value={"Estado":"STOP","id":id_taxi})
         client_socket.sendall(b"Servidor detenido")
@@ -284,7 +391,7 @@ def start_client(ip_central, puerto_central, id_taxi, client_socket_client,error
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         
-        client_socket.connect((ip_central, puerto_central))#CENTRAL
+        client_socket.connect((ip_central, int(puerto_central)))#CENTRAL
         if error == 1:
             value={"ESTADO":"STOP","id":id_taxi}
             client_socket.sendall(json.dumps(value).encode())
@@ -319,8 +426,4 @@ def start_client(ip_central, puerto_central, id_taxi, client_socket_client,error
 
 if __name__ == "__main__":
 
-    puerto_central = int(sys.argv[2])
-    ip_central = sys.argv[1]
-    id_taxi = sys.argv[3]
-    
     start_server()
