@@ -1,0 +1,6 @@
+colorama
+kafka-python
+numpy
+requests
+pyjwt
+mysql-connector-python
